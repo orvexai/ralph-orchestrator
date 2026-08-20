@@ -11,15 +11,17 @@ use crate::copilot_stream::CopilotStreamParser;
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
+use process_wrap::tokio::ChildWrapper;
 use std::env;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tracing::{debug, warn};
 
 const TEXT_POST_EVENT_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const TERMINATION_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Result of a CLI execution.
@@ -83,9 +85,6 @@ impl CliExecutor {
         command.args(&args);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
-        #[cfg(unix)]
-        command.process_group(0);
-
         // Set working directory to current directory (mirrors PTY executor behavior)
         // Use fallback to "." if current_dir fails (e.g., E2E test workspaces)
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -106,13 +105,13 @@ impl CliExecutor {
             command.stdin(Stdio::piped());
         }
 
-        let mut child = command.spawn()?;
+        let mut child = crate::process_tree::wrap_command(command).spawn()?;
 
         // Write to stdin if needed. Some short-lived commands can exit before
         // consuming stdin, which surfaces as BrokenPipe. Treat that as benign
         // and continue collecting output/exit status from the child.
         if let Some(input) = stdin_input
-            && let Some(mut stdin) = child.stdin.take()
+            && let Some(mut stdin) = child.stdin().take()
         {
             if let Err(err) = stdin.write_all(input.as_bytes()).await
                 && err.kind() != std::io::ErrorKind::BrokenPipe
@@ -128,8 +127,8 @@ impl CliExecutor {
 
         // Take both stdout and stderr handles upfront to read concurrently.
         // Each emitted line resets the inactivity timeout.
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        let stdout_handle = child.stdout().take();
+        let stderr_handle = child.stderr().take();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
 
         let stdout_task = stdout_handle.map(|stdout| {
@@ -252,28 +251,31 @@ impl CliExecutor {
 
     /// Terminates the child process with SIGTERM, then SIGKILL if it ignores graceful shutdown.
     async fn terminate_child_and_wait(
-        child: &mut Child,
+        child: &mut Box<dyn ChildWrapper>,
     ) -> std::io::Result<std::process::ExitStatus> {
-        #[cfg(not(unix))]
-        {
-            child.start_kill()?;
-            return child.wait().await;
-        }
-
-        #[cfg(unix)]
         if let Some(pid) = child.id() {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = Pid::from_raw(pid as i32);
-            let pgid = Pid::from_raw(-pid.as_raw());
-            debug!(%pid, "Sending SIGTERM to child process group");
-            let _ = kill(pgid, Signal::SIGTERM);
-            match tokio::time::timeout(TERMINATION_GRACE_TIMEOUT, child.wait()).await {
-                Ok(status) => status,
-                Err(_) => {
-                    warn!(%pid, "Child process ignored SIGTERM, sending SIGKILL");
-                    let _ = kill(pgid, Signal::SIGKILL);
-                    child.wait().await
+            #[cfg(unix)]
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                let pid = Pid::from_raw(pid as i32);
+                let pgid = Pid::from_raw(-pid.as_raw());
+                debug!(%pid, "Sending SIGTERM to child process group");
+                let _ = kill(pgid, Signal::SIGTERM);
+                match tokio::time::timeout(TERMINATION_GRACE_TIMEOUT, child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        warn!(%pid, "Child process ignored SIGTERM, sending SIGKILL");
+                        let _ = kill(pgid, Signal::SIGKILL);
+                        child.wait().await
+                    }
                 }
+            }
+
+            #[cfg(windows)]
+            {
+                let _ = pid;
+                child.start_kill()?;
+                child.wait().await
             }
         } else {
             child.wait().await
@@ -369,7 +371,7 @@ fn inject_ralph_runtime_env(command: &mut Command, workspace_root: &std::path::P
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -728,5 +730,29 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("\"assistant.message\""));
         assert_eq!(String::from_utf8(output).unwrap(), "hello from copilot\n");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_execute_cmd_uses_windows_process_tree_wrapper() {
+        let backend = CliBackend {
+            command: "cmd.exe".to_string(),
+            args: vec!["/C".to_string(), "echo".to_string()],
+            prompt_mode: PromptMode::Arg,
+            prompt_flag: None,
+            output_format: OutputFormat::Text,
+            env_vars: vec![],
+        };
+
+        let result = CliExecutor::new(backend)
+            .execute_capture("hello windows")
+            .await
+            .expect("cmd.exe should execute");
+        assert!(result.success);
+        assert!(result.output.contains("hello windows"));
     }
 }

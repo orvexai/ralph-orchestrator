@@ -1,6 +1,6 @@
 //! File locking for shared resources in multi-loop scenarios.
 //!
-//! Provides fine-grained file locking using `flock()` for concurrent access
+//! Provides fine-grained OS-backed file locking for concurrent access
 //! to shared resources like `.ralph/agent/tasks.jsonl` and `.ralph/agent/memories.md`.
 //! This enables multiple Ralph loops (in worktrees) to safely read and write
 //! shared state files.
@@ -101,73 +101,33 @@ impl FileLock {
     fn acquire(&self, lock_type: LockType) -> io::Result<LockGuard> {
         let file = self.open_lock_file()?;
 
-        #[cfg(unix)]
-        {
-            use nix::fcntl::{Flock, FlockArg};
-
-            let arg = match lock_type {
-                LockType::Shared => FlockArg::LockShared,
-                LockType::Exclusive => FlockArg::LockExclusive,
-            };
-
-            match Flock::lock(file, arg) {
-                Ok(flock) => Ok(LockGuard {
-                    _flock: flock,
-                    _lock_type: lock_type,
-                }),
-                Err((_, errno)) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("flock failed: {}", errno),
-                )),
-            }
+        match lock_type {
+            LockType::Shared => fs4::FileExt::lock_shared(&file)?,
+            LockType::Exclusive => fs4::FileExt::lock(&file)?,
         }
 
-        #[cfg(not(unix))]
-        {
-            let _ = (file, lock_type);
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "File locking not supported on this platform",
-            ))
-        }
+        Ok(LockGuard {
+            _file: file,
+            _lock_type: lock_type,
+        })
     }
 
     /// Tries to acquire a lock of the specified type (non-blocking).
     fn try_acquire(&self, lock_type: LockType) -> io::Result<Option<LockGuard>> {
         let file = self.open_lock_file()?;
 
-        #[cfg(unix)]
-        {
-            use nix::errno::Errno;
-            use nix::fcntl::{Flock, FlockArg};
+        let result = match lock_type {
+            LockType::Shared => fs4::FileExt::try_lock_shared(&file),
+            LockType::Exclusive => fs4::FileExt::try_lock(&file),
+        };
 
-            let arg = match lock_type {
-                LockType::Shared => FlockArg::LockSharedNonblock,
-                LockType::Exclusive => FlockArg::LockExclusiveNonblock,
-            };
-
-            match Flock::lock(file, arg) {
-                Ok(flock) => Ok(Some(LockGuard {
-                    _flock: flock,
-                    _lock_type: lock_type,
-                })),
-                Err((_, errno)) if errno == Errno::EWOULDBLOCK || errno == Errno::EAGAIN => {
-                    Ok(None)
-                }
-                Err((_, errno)) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("flock failed: {}", errno),
-                )),
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = (file, lock_type);
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "File locking not supported on this platform",
-            ))
+        match result {
+            Ok(()) => Ok(Some(LockGuard {
+                _file: file,
+                _lock_type: lock_type,
+            })),
+            Err(fs4::TryLockError::WouldBlock) => Ok(None),
+            Err(fs4::TryLockError::Error(error)) => Err(error),
         }
     }
 
@@ -199,9 +159,8 @@ enum LockType {
 /// A guard that holds the file lock. The lock is released when dropped.
 #[derive(Debug)]
 pub struct LockGuard {
-    /// The flock guard (Unix only).
-    #[cfg(unix)]
-    _flock: nix::fcntl::Flock<File>,
+    /// The open handle owns the OS lock for the guard lifetime.
+    _file: File,
 
     /// The type of lock held.
     _lock_type: LockType,

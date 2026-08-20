@@ -98,15 +98,22 @@ hats:
 fn test_guidance_persisted_to_scratchpad() {
     let dir = tempfile::tempdir().unwrap();
     let scratchpad_path = dir.path().join("scratchpad.md");
+    let workspace_root = serde_yaml::to_string(&dir.path().display().to_string())
+        .unwrap()
+        .trim()
+        .to_string();
+    let scratchpad = serde_yaml::to_string(&scratchpad_path.display().to_string())
+        .unwrap()
+        .trim()
+        .to_string();
 
     let yaml = format!(
         r#"
 core:
-  workspace_root: "{}"
-  scratchpad: "{}"
+  workspace_root: {}
+  scratchpad: {}
 "#,
-        dir.path().display(),
-        scratchpad_path.display()
+        workspace_root, scratchpad
     );
     let config: RalphConfig = serde_yaml::from_str(&yaml).unwrap();
     let mut event_loop = EventLoop::new(config);
@@ -143,15 +150,22 @@ fn test_guidance_appends_to_existing_scratchpad() {
 
     // Pre-populate scratchpad with existing content
     std::fs::write(&scratchpad_path, "## Existing Notes\n\nSome prior work.\n").unwrap();
+    let workspace_root = serde_yaml::to_string(&dir.path().display().to_string())
+        .unwrap()
+        .trim()
+        .to_string();
+    let scratchpad = serde_yaml::to_string(&scratchpad_path.display().to_string())
+        .unwrap()
+        .trim()
+        .to_string();
 
     let yaml = format!(
         r#"
 core:
-  workspace_root: "{}"
-  scratchpad: "{}"
+  workspace_root: {}
+  scratchpad: {}
 "#,
-        dir.path().display(),
-        scratchpad_path.display()
+        workspace_root, scratchpad
     );
     let config: RalphConfig = serde_yaml::from_str(&yaml).unwrap();
     let mut event_loop = EventLoop::new(config);

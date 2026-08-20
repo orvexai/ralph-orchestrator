@@ -24,6 +24,8 @@ use crate::copilot_stream::{
     CopilotStreamParser, CopilotStreamState, dispatch_copilot_stream_event,
 };
 use crate::pi_stream::{PiSessionState, PiStreamParser, dispatch_pi_stream_event};
+#[cfg(windows)]
+use crate::process_tree::force_kill_tree;
 use crate::stream_handler::{SessionResult, StreamHandler};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
@@ -1681,6 +1683,13 @@ impl PtyExecutor {
         child: &mut Box<dyn portable_pty::Child + Send>,
         _graceful: bool,
     ) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(pid) = child.process_id()
+            && force_kill_tree(pid).is_ok()
+        {
+            return Ok(());
+        }
+
         child.kill()
     }
 

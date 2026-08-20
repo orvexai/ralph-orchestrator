@@ -162,10 +162,16 @@ pub fn detect_backend_default() -> Result<String, NoBackendError> {
 mod tests {
     use super::*;
 
+    fn available_test_command() -> &'static str {
+        if cfg!(windows) { "cmd.exe" } else { "echo" }
+    }
+
     #[test]
     fn test_is_backend_available_echo() {
         // 'echo' command should always be available
-        let result = Command::new("echo").arg("--version").output();
+        let result = Command::new(available_test_command())
+            .arg("--version")
+            .output();
         // Just verify the command runs without panic
         assert!(result.is_ok());
     }
@@ -403,7 +409,7 @@ mod tests {
         let priority = &[
             "fake_nonexistent1",
             "fake_nonexistent2",
-            "echo",
+            available_test_command(),
             "fake_nonexistent3",
         ];
         let result = detect_backend(priority, |_| true);
@@ -411,14 +417,15 @@ mod tests {
         // Should succeed and return "echo" (first available in the priority list)
         assert!(result.is_ok());
         if let Ok(backend) = result {
-            assert_eq!(backend, "echo");
+            assert_eq!(backend, available_test_command());
         }
     }
 
     #[test]
     fn test_detect_backend_skips_to_next_available() {
         // Test that detection continues through priority list until it finds an available backend
-        let priority = &["fake_nonexistent1", "fake_nonexistent2", "echo"];
+        let available = available_test_command();
+        let priority = &["fake_nonexistent1", "fake_nonexistent2", available];
         let result = detect_backend(priority, |backend| {
             // Disable the first fake backend, enable the rest
             backend != "fake_nonexistent1"
@@ -427,7 +434,7 @@ mod tests {
         // Should succeed and return "echo" (first enabled and available)
         assert!(result.is_ok());
         if let Ok(backend) = result {
-            assert_eq!(backend, "echo");
+            assert_eq!(backend, available);
         }
     }
 }

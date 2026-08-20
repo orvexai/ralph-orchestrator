@@ -34,6 +34,7 @@ mod cli_executor;
 mod copilot_stream;
 mod json_rpc_handler;
 mod pi_stream;
+mod process_tree;
 mod pty_executor;
 pub mod pty_handle;
 mod stream_handler;

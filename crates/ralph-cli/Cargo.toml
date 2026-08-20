@@ -30,6 +30,7 @@ tokio.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 thiserror.workspace = true

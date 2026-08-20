@@ -671,6 +671,10 @@ async fn terminate_gracefully(child: &mut Child, grace_period: Duration) {
 /// Gracefully terminate a child process (non-Unix fallback using start_kill)
 #[cfg(not(unix))]
 async fn terminate_gracefully(child: &mut Child, _grace_period: Duration) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = crate::process_control::terminate_process(pid, true);
+    }
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -680,6 +684,7 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;

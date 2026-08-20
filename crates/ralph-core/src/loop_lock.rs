@@ -1,6 +1,6 @@
 //! Loop lock mechanism for preventing concurrent Ralph loops in the same workspace.
 //!
-//! Uses `flock()` on `.ralph/loop.lock` to ensure only one primary loop runs at a time.
+//! Uses an OS-backed lock on `.ralph/loop.lock` to ensure only one primary loop runs at a time.
 //! When a second loop attempts to start, it can detect the existing lock and spawn
 //! into a git worktree instead.
 //!
@@ -49,12 +49,7 @@ pub struct LockMetadata {
 /// A guard that holds the loop lock. The lock is released when this is dropped.
 #[derive(Debug)]
 pub struct LockGuard {
-    /// The open file handle (keeps the flock).
-    #[cfg(unix)]
-    _flock: nix::fcntl::Flock<File>,
-
-    /// Placeholder for non-unix (compilation only, never actually used)
-    #[cfg(not(unix))]
+    /// The open file handle owns the OS lock for the guard lifetime.
     _file: File,
 
     /// Path to the lock file.
@@ -70,7 +65,6 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // The Flock is automatically released when dropped.
         tracing::debug!("Releasing loop lock at {}", self.lock_path.display());
     }
 }
@@ -89,21 +83,22 @@ pub enum LockError {
     /// Failed to parse lock metadata.
     #[error("Failed to parse lock metadata: {0}")]
     ParseError(String),
-
-    /// Platform not supported (non-Unix).
-    #[error("File locking not supported on this platform")]
-    UnsupportedPlatform,
 }
 
 /// The loop lock mechanism.
 ///
-/// Uses `flock()` to provide advisory locking on `.ralph/loop.lock`.
+/// Uses an OS-backed advisory lock on `.ralph/loop.lock`.
 /// The lock is automatically released when the process exits (even on crash).
 pub struct LoopLock;
 
 impl LoopLock {
     /// The relative path to the lock file within the workspace.
     pub const LOCK_FILE: &'static str = ".ralph/loop.lock";
+
+    #[cfg(windows)]
+    fn metadata_path(lock_path: &Path) -> PathBuf {
+        lock_path.with_extension("lock.meta")
+    }
 
     /// Try to acquire the loop lock (non-blocking).
     ///
@@ -136,45 +131,22 @@ impl LoopLock {
             .truncate(false)
             .open(&lock_path)?;
 
-        // Try to acquire exclusive lock (non-blocking)
-        #[cfg(unix)]
-        {
-            use nix::fcntl::{Flock, FlockArg};
-
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(flock) => {
-                    // We got the lock - write our metadata
-                    Self::write_metadata(&flock, prompt)?;
-
-                    tracing::debug!("Acquired loop lock at {}", lock_path.display());
-
-                    Ok(LockGuard {
-                        _flock: flock,
-                        lock_path,
-                    })
-                }
-                Err((file, errno)) => {
-                    use nix::errno::Errno;
-                    // EWOULDBLOCK and EAGAIN are the same on some platforms (macOS)
-                    if errno == Errno::EWOULDBLOCK || errno == Errno::EAGAIN {
-                        // Lock is held by another process - read their metadata
-                        let metadata = Self::read_metadata(&file)?;
-                        Err(LockError::AlreadyLocked(metadata))
-                    } else {
-                        Err(LockError::Io(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("flock failed: {}", errno),
-                        )))
-                    }
-                }
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => {
+                Self::write_metadata(&file, prompt)?;
+                #[cfg(windows)]
+                Self::write_metadata_sidecar(&lock_path, prompt)?;
+                tracing::debug!("Acquired loop lock at {}", lock_path.display());
+                Ok(LockGuard {
+                    _file: file,
+                    lock_path,
+                })
             }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            let _ = prompt;
-            Err(LockError::UnsupportedPlatform)
+            Err(fs4::TryLockError::WouldBlock) => {
+                let metadata = Self::read_existing_metadata(&lock_path, &file)?;
+                Err(LockError::AlreadyLocked(metadata))
+            }
+            Err(fs4::TryLockError::Error(error)) => Err(LockError::Io(error)),
         }
     }
 
@@ -210,35 +182,17 @@ impl LoopLock {
             .truncate(false)
             .open(&lock_path)?;
 
-        #[cfg(unix)]
-        {
-            use nix::fcntl::{Flock, FlockArg};
+        fs4::FileExt::lock(&file).map_err(LockError::Io)?;
+        Self::write_metadata(&file, prompt)?;
+        #[cfg(windows)]
+        Self::write_metadata_sidecar(&lock_path, prompt)?;
 
-            match Flock::lock(file, FlockArg::LockExclusive) {
-                Ok(flock) => {
-                    // We got the lock - write our metadata
-                    Self::write_metadata(&flock, prompt)?;
+        tracing::debug!("Acquired loop lock (blocking) at {}", lock_path.display());
 
-                    tracing::debug!("Acquired loop lock (blocking) at {}", lock_path.display());
-
-                    Ok(LockGuard {
-                        _flock: flock,
-                        lock_path,
-                    })
-                }
-                Err((_, errno)) => Err(LockError::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("flock failed: {}", errno),
-                ))),
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            let _ = prompt;
-            Err(LockError::UnsupportedPlatform)
-        }
+        Ok(LockGuard {
+            _file: file,
+            lock_path,
+        })
     }
 
     /// Read the metadata from an existing lock file.
@@ -254,7 +208,7 @@ impl LoopLock {
         }
 
         let file = File::open(&lock_path)?;
-        match Self::read_metadata(&file) {
+        match Self::read_existing_metadata(&lock_path, &file) {
             Ok(metadata) => Ok(Some(metadata)),
             Err(LockError::ParseError(_)) => Ok(None),
             Err(e) => Err(e),
@@ -276,56 +230,58 @@ impl LoopLock {
             .write(true) // Need write for exclusive lock
             .open(&lock_path)?;
 
-        #[cfg(unix)]
-        {
-            use nix::errno::Errno;
-            use nix::fcntl::{Flock, FlockArg};
-
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(_flock) => {
-                    // We got the lock - it will be released when _flock is dropped
-                    Ok(false)
-                }
-                Err((_, errno)) => {
-                    if errno == Errno::EWOULDBLOCK || errno == Errno::EAGAIN {
-                        Ok(true)
-                    } else {
-                        Err(LockError::Io(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("flock failed: {}", errno),
-                        )))
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-            Err(LockError::UnsupportedPlatform)
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(false),
+            Err(fs4::TryLockError::WouldBlock) => Ok(true),
+            Err(fs4::TryLockError::Error(error)) => Err(LockError::Io(error)),
         }
     }
 
     /// Write lock metadata to the file.
     fn write_metadata(file: &File, prompt: &str) -> Result<(), LockError> {
+        // Use a mutable reference via clone for writing
+        let mut file_clone = file.try_clone()?;
+        file_clone.set_len(0)?;
+        file_clone.seek(SeekFrom::Start(0))?;
+
+        let json = Self::metadata_json(prompt)?;
+        file_clone.write_all(json.as_bytes())?;
+        file_clone.sync_all()?;
+
+        Ok(())
+    }
+
+    fn metadata_json(prompt: &str) -> Result<String, LockError> {
         let metadata = LockMetadata {
             pid: process::id(),
             started: Utc::now(),
             prompt: prompt.to_string(),
         };
 
-        // Use a mutable reference via clone for writing
-        let mut file_clone = file.try_clone()?;
-        file_clone.set_len(0)?;
-        file_clone.seek(SeekFrom::Start(0))?;
+        serde_json::to_string_pretty(&metadata).map_err(|e| LockError::ParseError(e.to_string()))
+    }
 
-        let json = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| LockError::ParseError(e.to_string()))?;
-
-        file_clone.write_all(json.as_bytes())?;
-        file_clone.sync_all()?;
-
+    #[cfg(windows)]
+    fn write_metadata_sidecar(lock_path: &Path, prompt: &str) -> Result<(), LockError> {
+        let sidecar_path = Self::metadata_path(lock_path);
+        let temp_path = sidecar_path.with_extension("lock.meta.tmp");
+        fs::write(&temp_path, Self::metadata_json(prompt)?)?;
+        fs::rename(temp_path, sidecar_path)?;
         Ok(())
+    }
+
+    fn read_existing_metadata(lock_path: &Path, file: &File) -> Result<LockMetadata, LockError> {
+        #[cfg(windows)]
+        {
+            let sidecar_path = Self::metadata_path(lock_path);
+            if sidecar_path.exists() {
+                let contents = fs::read_to_string(sidecar_path)?;
+                return serde_json::from_str(&contents)
+                    .map_err(|e| LockError::ParseError(e.to_string()));
+            }
+        }
+
+        Self::read_metadata(file)
     }
 
     /// Read lock metadata from the file.
@@ -360,7 +316,11 @@ mod tests {
         assert!(lock_path.exists());
 
         // Metadata should be readable
-        let contents = fs::read_to_string(&lock_path).unwrap();
+        #[cfg(windows)]
+        let metadata_path = LoopLock::metadata_path(&lock_path);
+        #[cfg(not(windows))]
+        let metadata_path = lock_path;
+        let contents = fs::read_to_string(metadata_path).unwrap();
         let metadata: LockMetadata = serde_json::from_str(&contents).unwrap();
         assert_eq!(metadata.pid, process::id());
         assert_eq!(metadata.prompt, "test prompt");

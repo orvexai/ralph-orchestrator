@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tracing::{error, info, warn};
+#[cfg(unix)]
+use tracing::error;
+use tracing::{info, warn};
 
 use ralph_proto::daemon::{DaemonAdapter, StartLoopFn};
 

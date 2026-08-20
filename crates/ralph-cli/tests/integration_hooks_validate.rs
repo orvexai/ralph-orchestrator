@@ -83,6 +83,9 @@ fn make_executable(path: &Path) {
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("set executable permissions");
     }
+
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[test]
@@ -296,8 +299,9 @@ hooks:
     assert_eq!(report["hooks_enabled"], true);
     assert_eq!(report["checked_hooks"], 1);
     let source = report["source"].as_str().expect("source should be string");
+    let normalized_source = source.replace('\\', "/");
     assert!(
-        source.contains(".ralph/config.yml"),
+        normalized_source.contains(".ralph/config.yml"),
         "expected global config source, got: {source}"
     );
 }

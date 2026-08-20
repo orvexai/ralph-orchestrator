@@ -570,9 +570,23 @@ fn resolve_hook_command(
 
     let mut visited = HashSet::new();
     let extensions = executable_extensions();
+    let command_has_extension = command_path.extension().is_some();
 
     for dir in env::split_paths(&path_value) {
         if !visited.insert(dir.clone()) {
+            continue;
+        }
+
+        // A command that already names its executable extension (for example
+        // `cmd.exe` or a project-local `.cmd` hook) must be checked verbatim.
+        // Appending PATHEXT to it would search for `cmd.exe.EXE` and reject a
+        // valid native Windows executable.
+        let direct_candidate = dir.join(command);
+        if is_executable_file(&direct_candidate) {
+            return Ok(direct_candidate);
+        }
+
+        if command_has_extension {
             continue;
         }
 

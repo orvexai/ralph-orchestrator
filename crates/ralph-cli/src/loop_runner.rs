@@ -5738,6 +5738,7 @@ enum AcpWaveExecutionResult {
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
+#[cfg_attr(windows, allow(dead_code))]
 enum MockAcpExecution {
     Success {
         success: bool,
@@ -5753,6 +5754,7 @@ enum MockAcpExecution {
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 impl MockAcpExecution {
     fn success(success: bool, events: Vec<ralph_core::Event>) -> Self {
         Self::Success { success, events }
@@ -5941,6 +5943,7 @@ async fn run_wave_worker_pty(
     // events only arrive when the process exits. Using a PTY forces the
     // child to see a terminal and flush after each line.
     let (cmd, args, stdin_input, _temp_file_guard) = worker_backend.build_command(prompt, false);
+    #[cfg(unix)]
     let mut stdin_prompt_file = None;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -5973,6 +5976,7 @@ async fn run_wave_worker_pty(
         }
     };
 
+    #[cfg(unix)]
     let (spawn_cmd, spawn_args) = if let Some(input) = stdin_input.as_ref() {
         let mut prompt_file = match tempfile::NamedTempFile::new() {
             Ok(file) => file,
@@ -6014,6 +6018,9 @@ async fn run_wave_worker_pty(
         (cmd.clone(), args.clone())
     };
 
+    #[cfg(windows)]
+    let (spawn_cmd, spawn_args) = (cmd.clone(), args.clone());
+
     let mut cmd_builder = portable_pty::CommandBuilder::new(&spawn_cmd);
     cmd_builder.args(&spawn_args);
     cmd_builder.cwd(&cwd);
@@ -6034,8 +6041,18 @@ async fn run_wave_worker_pty(
     };
     drop(pty_pair.slave);
 
+    #[cfg(unix)]
     if let Some(input) = stdin_input
         && stdin_prompt_file.is_none()
+        && let Ok(mut writer) = pty_pair.master.take_writer()
+    {
+        let _ = writer.write_all(input.as_bytes());
+        let _ = writer.write_all(b"\n");
+        let _ = writer.flush();
+    }
+
+    #[cfg(windows)]
+    if let Some(input) = stdin_input
         && let Ok(mut writer) = pty_pair.master.take_writer()
     {
         let _ = writer.write_all(input.as_bytes());
@@ -6124,6 +6141,11 @@ async fn run_wave_worker_pty(
                 "Wave worker timeout, killing process"
             );
             timed_out = true;
+            #[cfg(windows)]
+            if let Some(pid) = child.process_id() {
+                let _ = crate::process_control::terminate_process(pid, true);
+            }
+            #[cfg(not(windows))]
             let _ = child.kill();
         }
     }
@@ -6335,8 +6357,10 @@ fn merge_wave_results_to_events_file(
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::CwdGuard;
     use ralph_core::HatRegistry;
     use ralph_core::planning_session::{ConversationEntry, ConversationType};
@@ -6695,7 +6719,6 @@ printf '%s\n' "$payload" >> "$1""#
         EventLoop::new(config)
     }
 
-    #[cfg(unix)]
     fn dispatch_test_event_loop_with_context(workspace_root: &Path) -> (EventLoop, LoopContext) {
         let mut config = RalphConfig::default();
         config.core.workspace_root = workspace_root.to_path_buf();

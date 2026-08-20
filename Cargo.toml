@@ -106,6 +106,7 @@ tungstenite = "0.24"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+base64 = "0.22"
 
 # OS keychain for secure credential storage
 keyring = { version = "3", features = ["apple-native", "linux-native"] }
@@ -135,6 +136,10 @@ open = "5"
 # PTY support
 portable-pty = "0.9"
 nix = { version = "0.29", features = ["signal", "term", "fs"] }
+fs4 = "1.1"
+junction = "2.0"
+process-wrap = { version = "9.1", default-features = false, features = ["creation-flags", "job-object", "kill-on-drop", "process-group", "tokio1", "tracing"] }
+sysinfo = { version = "0.30", default-features = false }
 vt100 = "0.15"
 scopeguard = "1"
 strip-ansi-escapes = "0.2"
@@ -158,10 +163,9 @@ teloxide = { version = "0.13", default-features = false, features = ["macros", "
 # CI backends to support
 ci = "github"
 # Target platforms to build apps for (Rust target-triple syntax)
-# Windows excluded: Ralph requires Unix PTY and signal handling
 # Linux uses musl (statically linked) so a single binary works on every distro
 # (AL2/AL2023, Alpine, Debian, Ubuntu) without a glibc-version compatibility matrix.
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"]
 # The installers to generate for each app
 installers = ["shell", "npm"]
 # npm package scope (creates @ralph-orchestrator/ralph)

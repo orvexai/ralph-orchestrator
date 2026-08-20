@@ -191,10 +191,6 @@ pub enum MergeQueueError {
     /// Invalid state transition.
     #[error("Invalid state transition for {0}: cannot transition from {1:?} to {2:?}")]
     InvalidTransition(String, MergeState, MergeState),
-
-    /// Platform not supported.
-    #[error("File locking not supported on this platform")]
-    UnsupportedPlatform,
 }
 
 /// Merge queue for tracking parallel loop merges.
@@ -479,48 +475,23 @@ impl MergeQueue {
     }
 
     /// Executes an operation with a shared (read) lock on the queue file.
-    #[cfg(unix)]
     fn with_shared_lock<T, F>(&self, f: F) -> Result<T, MergeQueueError>
     where
         F: FnOnce(&File) -> Result<T, MergeQueueError>,
     {
-        use nix::fcntl::{Flock, FlockArg};
-
         let file = File::open(&self.queue_path)?;
 
         // Acquire shared lock (blocking)
-        let flock = Flock::lock(file, FlockArg::LockShared).map_err(|(_, errno)| {
-            MergeQueueError::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("flock failed: {}", errno),
-            ))
-        })?;
-
-        // Get a reference to the inner file
-        use std::os::fd::AsFd;
-        let borrowed_fd = flock.as_fd();
-        let owned_fd = borrowed_fd.try_clone_to_owned()?;
-        let file: File = owned_fd.into();
+        fs4::FileExt::lock_shared(&file)?;
 
         f(&file)
     }
 
-    #[cfg(not(unix))]
-    fn with_shared_lock<T, F>(&self, _f: F) -> Result<T, MergeQueueError>
-    where
-        F: FnOnce(&File) -> Result<T, MergeQueueError>,
-    {
-        Err(MergeQueueError::UnsupportedPlatform)
-    }
-
     /// Executes an operation with an exclusive (write) lock on the queue file.
-    #[cfg(unix)]
     fn with_exclusive_lock<T, F>(&self, f: F) -> Result<T, MergeQueueError>
     where
         F: FnOnce(File) -> Result<T, MergeQueueError>,
     {
-        use nix::fcntl::{Flock, FlockArg};
-
         // Ensure .ralph directory exists
         if let Some(parent) = self.queue_path.parent() {
             fs::create_dir_all(parent)?;
@@ -535,28 +506,9 @@ impl MergeQueue {
             .open(&self.queue_path)?;
 
         // Acquire exclusive lock (blocking)
-        let flock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, errno)| {
-            MergeQueueError::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("flock failed: {}", errno),
-            ))
-        })?;
-
-        // Get a clone of the underlying file
-        use std::os::fd::AsFd;
-        let borrowed_fd = flock.as_fd();
-        let owned_fd = borrowed_fd.try_clone_to_owned()?;
-        let file: File = owned_fd.into();
+        fs4::FileExt::lock(&file)?;
 
         f(file)
-    }
-
-    #[cfg(not(unix))]
-    fn with_exclusive_lock<T, F>(&self, _f: F) -> Result<T, MergeQueueError>
-    where
-        F: FnOnce(File) -> Result<T, MergeQueueError>,
-    {
-        Err(MergeQueueError::UnsupportedPlatform)
     }
 }
 
@@ -597,19 +549,7 @@ pub fn merge_button_state(
 
 /// Check if a process with the given PID is still running.
 fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::kill;
-        use nix::unistd::Pid;
-        // Signal 0 (None) doesn't send any signal but checks if the process exists
-        kill(Pid::from_raw(pid as i32), None).is_ok()
-    }
-
-    #[cfg(not(unix))]
-    {
-        // On non-Unix, assume the process is alive if we can't check
-        true
-    }
+    crate::loop_registry::is_process_alive(pid)
 }
 
 /// Generate a smart merge summary from worktree commits.

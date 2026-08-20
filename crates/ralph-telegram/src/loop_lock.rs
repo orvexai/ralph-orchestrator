@@ -1,7 +1,7 @@
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use ralph_core::LoopLock;
 
 pub(crate) const LOOP_LOCK_FILE: &str = ".ralph/loop.lock";
 
@@ -23,33 +23,10 @@ pub(crate) fn lock_state(workspace_root: &Path) -> anyhow::Result<LockState> {
         return Ok(LockState::Inactive);
     }
 
-    #[cfg(unix)]
+    match LoopLock::is_locked(workspace_root)
+        .with_context(|| format!("check lock state at {}", path.display()))?
     {
-        use nix::errno::Errno;
-        use nix::fcntl::{Flock, FlockArg};
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("open lock file at {}", path.display()))?;
-
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(_flock) => Ok(LockState::Stale),
-            Err((_, errno)) if errno == Errno::EWOULDBLOCK || errno == Errno::EAGAIN => {
-                Ok(LockState::Active)
-            }
-            Err((_, errno)) => Err(anyhow::anyhow!(
-                "flock failed for {}: {}",
-                path.display(),
-                errno
-            )),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(LockState::Active)
+        true => Ok(LockState::Active),
+        false => Ok(LockState::Stale),
     }
 }

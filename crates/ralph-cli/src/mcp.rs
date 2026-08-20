@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn resolve_workspace_root_preserves_absolute_paths() -> Result<()> {
-        let path = PathBuf::from("/tmp/ralph-workspace");
+        let path = std::env::temp_dir().join("ralph-workspace");
         assert_eq!(resolve_workspace_root(Some(path.clone()))?, Some(path));
         Ok(())
     }
@@ -75,11 +75,11 @@ mod tests {
     #[test]
     fn resolve_workspace_root_resolves_relative_paths_from_current_dir() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        let canonical = temp_dir.path().canonicalize()?;
         let _guard = CwdGuard::set(temp_dir.path());
+        let current_dir = std::env::current_dir()?;
 
         let resolved = resolve_workspace_root(Some(PathBuf::from("nested/workspace")))?;
-        assert_eq!(resolved, Some(canonical.join("nested/workspace")));
+        assert_eq!(resolved, Some(current_dir.join("nested/workspace")));
         Ok(())
     }
 }

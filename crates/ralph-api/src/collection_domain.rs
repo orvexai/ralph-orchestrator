@@ -507,6 +507,7 @@ mod tests {
         (temp, domain, record.id)
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_surfaces_stderr_from_failed_spawn() {
         // A stub "ralph" that prints a distinctive error and exits non-zero.

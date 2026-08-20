@@ -32,6 +32,7 @@ mod mcp;
 mod memory;
 mod preflight;
 mod presets;
+mod process_control;
 mod rpc_stdin;
 mod skill_cli;
 mod sop_runner;
@@ -1759,12 +1760,6 @@ async fn run_command(
                     (context, None)
                 }
             }
-            Err(LockError::UnsupportedPlatform) => {
-                // Non-Unix: just run without locking (single-loop fallback)
-                warn!("Loop locking not supported on this platform, running without lock");
-                let context = LoopContext::primary(workspace_root.clone());
-                (context, None)
-            }
             Err(e) => {
                 return Err(anyhow::Error::new(e).context("Failed to acquire loop lock"));
             }
@@ -1883,7 +1878,14 @@ async fn run_command(
 
         #[cfg(not(unix))]
         {
-            anyhow::bail!("Restart via single-command shell restart is only supported on Unix");
+            #[cfg(windows)]
+            {
+                spawn_windows_restart(&workspace_root, config_sources, hats_source)?;
+                return Ok(());
+            }
+
+            #[cfg(not(windows))]
+            anyhow::bail!("Restart is not supported on this platform");
         }
     }
 
@@ -1897,8 +1899,77 @@ async fn run_command(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn required_restart_command(pid: u32) -> String {
     format!("kill {pid} && RALPH_DIAGNOSTICS=1 cargo run --bin ralph -- resume -c ralph.test.yml")
+}
+
+/// Detaches a native Windows restart helper that waits for this process to
+/// exit before starting `ralph run --continue` with the same config sources.
+///
+/// The PowerShell program is UTF-16LE/base64 encoded so paths and configured
+/// arguments cannot be reinterpreted as PowerShell syntax.
+#[cfg(windows)]
+fn spawn_windows_restart(
+    workspace_root: &Path,
+    config_sources: &[ConfigSource],
+    hats_source: Option<&HatsSource>,
+) -> Result<()> {
+    use base64::Engine;
+
+    fn powershell_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    let executable = std::env::current_exe().context("Failed to resolve Ralph executable")?;
+    let mut child_args = vec!["run".to_string(), "--continue".to_string()];
+    for source in config_sources {
+        child_args.push("-c".to_string());
+        child_args.push(source.to_cli_string());
+    }
+    if let Some(source) = hats_source {
+        child_args.push("-H".to_string());
+        child_args.push(source.label());
+    }
+
+    let args_literal = child_args
+        .iter()
+        .map(|arg| powershell_literal(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "$oldPid = {}; while (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; $env:RALPH_DIAGNOSTICS = '1'; Start-Process -FilePath {} -ArgumentList @({}) -WorkingDirectory {}",
+        std::process::id(),
+        powershell_literal(&executable.to_string_lossy()),
+        args_literal,
+        powershell_literal(&workspace_root.to_string_lossy()),
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join(r"WindowsPowerShell\v1.0\powershell.exe")
+        })
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+    std::process::Command::new(powershell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .spawn()
+        .context("Failed to spawn Windows restart helper")?;
+    Ok(())
 }
 
 fn clear_restart_request_signal(workspace_root: &std::path::Path) {

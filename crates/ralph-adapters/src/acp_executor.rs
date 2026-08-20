@@ -25,6 +25,7 @@ use agent_client_protocol::{
     WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use anyhow::{Context, Result};
+use process_wrap::tokio::ChildWrapper;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
@@ -32,8 +33,12 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, warn};
 
 use crate::cli_backend::CliBackend;
+#[cfg(windows)]
+use crate::process_tree::force_kill_tree;
 use crate::pty_executor::{PtyExecutionResult, TerminationType};
 use crate::stream_handler::{SessionResult, StreamHandler};
+
+type ManagedChild = Box<dyn ChildWrapper>;
 
 /// Events dispatched from the ACP Client impl to the executor.
 enum AcpEvent {
@@ -57,7 +62,7 @@ enum AcpEvent {
 
 /// State for a single ACP terminal (child process + captured output).
 struct TerminalState {
-    child: Option<tokio::process::Child>,
+    child: Option<ManagedChild>,
     pid: Option<u32>,
     output: Rc<RefCell<Vec<u8>>>,
     output_truncated: Rc<RefCell<bool>>,
@@ -76,7 +81,7 @@ const TERMINAL_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 struct PendingTerminalWait {
     terminals: Terminals,
     terminal_id: String,
-    child: Option<tokio::process::Child>,
+    child: Option<ManagedChild>,
     reader: Option<tokio::task::JoinHandle<()>>,
     cleanup_in_progress: Option<Rc<RefCell<bool>>>,
 }
@@ -214,6 +219,7 @@ async fn terminate_terminal_process_group(pid: Option<u32>) {
 }
 
 fn terminal_exit_status(status: std::process::ExitStatus) -> TerminalExitStatus {
+    #[allow(unused_mut)]
     let mut exit_status = TerminalExitStatus::new().exit_code(status.code().map(|c| c as u32));
 
     #[cfg(unix)]
@@ -362,11 +368,7 @@ impl agent_client_protocol::Client for RalphAcpClient {
         cmd.args(&args.args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-
-        #[cfg(unix)]
-        cmd.process_group(0);
+            .stdin(std::process::Stdio::null());
 
         if let Some(cwd) = &args.cwd {
             cmd.current_dir(cwd);
@@ -375,11 +377,13 @@ impl agent_client_protocol::Client for RalphAcpClient {
             cmd.env(&env_var.name, &env_var.value);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            let mut err = agent_client_protocol::Error::internal_error();
-            err.message = format!("spawn failed: {e}");
-            err
-        })?;
+        let mut child = crate::process_tree::wrap_command(cmd)
+            .spawn()
+            .map_err(|e| {
+                let mut err = agent_client_protocol::Error::internal_error();
+                err.message = format!("spawn failed: {e}");
+                err
+            })?;
 
         let pid = child.id();
         let id = format!("term-{}", pid.unwrap_or(0));
@@ -391,8 +395,8 @@ impl agent_client_protocol::Client for RalphAcpClient {
         let release_requested = Rc::new(RefCell::new(false));
 
         // Spawn background reader for stdout
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.stdout().take();
+        let stderr = child.stderr().take();
         let buf_clone = Rc::clone(&output_buf);
         let truncated_clone = Rc::clone(&output_truncated);
         let exit_clone = Rc::clone(&exit_status);
@@ -473,7 +477,7 @@ impl agent_client_protocol::Client for RalphAcpClient {
             AwaitExisting(Rc<RefCell<Option<TerminalExitStatus>>>),
             AwaitChild {
                 terminal_id: String,
-                child: tokio::process::Child,
+                child: ManagedChild,
                 exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
                 pending_exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
                 cleanup_in_progress: Rc<RefCell<bool>>,
@@ -661,7 +665,7 @@ impl agent_client_protocol::Client for RalphAcpClient {
                 },
                 Remove,
                 Cleanup {
-                    child: Option<tokio::process::Child>,
+                    child: Option<ManagedChild>,
                     reader: Option<tokio::task::JoinHandle<()>>,
                     exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
                     pending_exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
@@ -772,7 +776,7 @@ impl agent_client_protocol::Client for RalphAcpClient {
         }
 
         struct KillCleanupPlan {
-            child: Option<tokio::process::Child>,
+            child: Option<ManagedChild>,
             reader: Option<tokio::task::JoinHandle<()>>,
             exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
             pending_exit_rc: Rc<RefCell<Option<TerminalExitStatus>>>,
@@ -896,10 +900,15 @@ impl Drop for ChildKillGuard {
         {
             // Kill the entire process group (negative PID) so grandchildren
             // (e.g. MCP servers) are also terminated — not just the direct child.
+            #[cfg(unix)]
             let pgid = nix::unistd::Pid::from_raw(-(pid as i32));
+            #[cfg(unix)]
             let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGTERM);
             std::thread::sleep(Duration::from_millis(100));
+            #[cfg(unix)]
             let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL);
+            #[cfg(windows)]
+            let _ = force_kill_tree(pid);
         }
     }
 }
@@ -1000,8 +1009,12 @@ impl AcpExecutor {
         if let Ok(guard) = child_pid.lock()
             && let Some(pid) = *guard
         {
+            #[cfg(unix)]
             let pgid = nix::unistd::Pid::from_raw(-(pid as i32));
+            #[cfg(unix)]
             let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL);
+            #[cfg(windows)]
+            let _ = force_kill_tree(pid);
         }
 
         // Wait for the blocking task to finish so it doesn't leak.
@@ -1074,19 +1087,16 @@ async fn run_acp_lifecycle_inner(
     tx: &mpsc::UnboundedSender<AcpEvent>,
     child_pid: &Arc<Mutex<Option<u32>>>,
 ) -> Result<()> {
-    // Spawn child process in its own process group so we can kill the
-    // entire tree (including MCP servers) with a single group signal.
+    // Own the complete child tree so cancellation cannot orphan MCP servers.
     let mut cmd = tokio::process::Command::new(&backend.command);
     cmd.args(&backend.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
 
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd.spawn().context("Failed to spawn ACP process")?;
+    let mut child = crate::process_tree::wrap_command(cmd)
+        .spawn()
+        .context("Failed to spawn ACP process")?;
 
     // Record PID so the caller can kill the process if needed.
     if let Some(pid) = child.id()
@@ -1095,11 +1105,11 @@ async fn run_acp_lifecycle_inner(
         *guard = Some(pid);
     }
 
-    let child_stdin = child.stdin.take().context("No stdin")?;
-    let child_stdout = child.stdout.take().context("No stdout")?;
+    let child_stdin = child.stdin().take().context("No stdin")?;
+    let child_stdout = child.stdout().take().context("No stdout")?;
 
     // Log stderr from kiro-cli so we can see errors
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr().take() {
         tokio::task::spawn_local(async move {
             let mut reader = tokio::io::BufReader::new(stderr);
             let mut line = String::new();
@@ -1185,14 +1195,15 @@ async fn run_acp_lifecycle_inner(
     match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
         Ok(_) => {}
         Err(_) => {
-            let _ = child.kill().await;
+            child.start_kill().context("Failed to kill ACP process")?;
+            let _ = child.wait().await;
         }
     }
 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use agent_client_protocol::Client;
@@ -2326,6 +2337,31 @@ mod tests {
                     WaitForTerminalExitRequest::new("test-session", resp.terminal_id.clone());
                 let wait_resp = client.wait_for_terminal_exit(wait_req).await.unwrap();
                 assert_ne!(wait_resp.exit_status.exit_code, Some(0));
+            })
+            .await;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use agent_client_protocol::Client;
+
+    #[tokio::test]
+    async fn test_windows_terminal_uses_job_object_cleanup() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let terminals = Rc::new(RefCell::new(HashMap::new()));
+                let client = RalphAcpClient { tx, terminals };
+                let request = CreateTerminalRequest::new("test-session", "cmd.exe")
+                    .args(vec!["/C".into(), "echo hello windows".into()]);
+                let response = client.create_terminal(request).await.unwrap();
+                let wait =
+                    WaitForTerminalExitRequest::new("test-session", response.terminal_id.clone());
+                let status = client.wait_for_terminal_exit(wait).await.unwrap();
+                assert_eq!(status.exit_status.exit_code, Some(0));
             })
             .await;
     }

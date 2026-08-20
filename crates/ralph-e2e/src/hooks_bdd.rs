@@ -8,7 +8,7 @@ use crate::executor::{find_workspace_root, resolve_ralph_binary};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -391,7 +391,7 @@ impl HooksBddIntegrationHarness {
                 Ok(None) => {
                     if start.elapsed() >= timeout {
                         timed_out = true;
-                        if let Err(source) = child.kill()
+                        if let Err(source) = terminate_bounded_child(&mut child)
                             && source.kind() != std::io::ErrorKind::InvalidInput
                         {
                             return Err(format!(
@@ -460,6 +460,30 @@ impl HooksBddIntegrationHarness {
     pub fn into_artifacts(self) -> HooksBddScenarioArtifacts {
         self.artifacts
     }
+}
+
+#[cfg(windows)]
+fn terminate_bounded_child(child: &mut Child) -> std::io::Result<()> {
+    let pid = child.id();
+    let taskkill = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("taskkill.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+
+    let status = Command::new(taskkill)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_bounded_child(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
 }
 
 /// Result of executing one hooks BDD scenario.
@@ -1017,10 +1041,13 @@ fn assert_required_source_snippets(
     source_content: &str,
     required_snippets: &[(&str, &str)],
 ) -> Result<(), String> {
+    // Git checkout and filesystem newline policy are platform-dependent;
+    // source-evidence assertions should inspect logical text, not CRLF vs LF.
+    let normalized_source = source_content.replace("\r\n", "\n");
     let missing: Vec<String> = required_snippets
         .iter()
         .filter_map(|(description, snippet)| {
-            (!source_content.contains(snippet))
+            (!normalized_source.contains(snippet))
                 .then_some(format!("{description} (snippet: `{snippet}`)"))
         })
         .collect();
@@ -2543,15 +2570,17 @@ mod tests {
             .prepare_temp_workspace("command timeout capture")
             .expect("workspace should be created");
 
-        // Write a minimal ralph.yml with a dummy backend (`sleep 3600`)
+        // Write a minimal ralph.yml with a dummy backend that stays alive
+        // long enough for the bounded-command timeout to fire.
+        let backend_config = if cfg!(windows) {
+            "cli:\n  backend: custom\n  command: cmd.exe\n  args: [\"/C\", \"ping\", \"-n\", \"3600\", \"127.0.0.1\"]\n  prompt_mode: stdin\n"
+        } else {
+            "cli:\n  backend: custom\n  command: sleep\n  args: [\"3600\"]\n  prompt_mode: stdin\n"
+        };
         // so `ralph run` enters the event loop and blocks long enough for
         // the bounded-command timeout to fire.
         harness
-            .write_workspace_file(
-                &workspace_dir,
-                "ralph.yml",
-                "cli:\n  backend: custom\n  command: sleep\n  args: [\"3600\"]\n  prompt_mode: stdin\n",
-            )
+            .write_workspace_file(&workspace_dir, "ralph.yml", backend_config)
             .expect("should write ralph.yml");
 
         // The workspace needs a git repo for ralph to start.

@@ -44,6 +44,21 @@ export PATH="$HOME/bin:$PATH"
 
 > Homebrew is not currently published from this repository's automated release flow.
 
+### Windows
+
+Native Windows builds are published for `x86_64-pc-windows-msvc`. Install with npm or
+Cargo, or download the Windows `.zip` archive from the latest GitHub Release and add
+the extracted directory to your user `PATH`:
+
+```powershell
+cargo install ralph-cli
+# Or download ralph-cli-x86_64-pc-windows-msvc.zip from Releases,
+# extract it, and add its directory to PATH.
+```
+
+Windows worktree loops use NTFS junctions and file links; Developer Mode and WSL are
+not required. Git for Windows is still required for worktree and merge operations.
+
 ## Verify Installation
 
 ```bash

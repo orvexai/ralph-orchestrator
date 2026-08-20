@@ -41,8 +41,14 @@
 //!
 //! // Primary loop runs in current directory
 //! let primary = LoopContext::primary(PathBuf::from("/project"));
-//! assert_eq!(primary.events_path().to_string_lossy(), "/project/.ralph/events.jsonl");
-//! assert_eq!(primary.tasks_path().to_string_lossy(), "/project/.ralph/agent/tasks.jsonl");
+//! assert_eq!(
+//!     primary.events_path(),
+//!     PathBuf::from("/project").join(".ralph/events.jsonl")
+//! );
+//! assert_eq!(
+//!     primary.tasks_path(),
+//!     PathBuf::from("/project").join(".ralph/agent/tasks.jsonl")
+//! );
 //!
 //! // Worktree loop runs in isolated directory
 //! let worktree = LoopContext::worktree(
@@ -50,8 +56,11 @@
 //!     PathBuf::from("/project/.worktrees/loop-1234-abcd"),
 //!     PathBuf::from("/project"),
 //! );
-//! assert_eq!(worktree.events_path().to_string_lossy(),
-//!            "/project/.worktrees/loop-1234-abcd/.ralph/events.jsonl");
+//! assert_eq!(
+//!     worktree.events_path(),
+//!     PathBuf::from("/project")
+//!         .join(".worktrees/loop-1234-abcd/.ralph/events.jsonl")
+//! );
 //! ```
 
 use crate::text::truncate_with_ellipsis;
@@ -410,12 +419,25 @@ impl LoopContext {
         Ok(true)
     }
 
-    /// Creates the memory symlink in a worktree (non-Unix stub).
-    #[cfg(not(unix))]
+    /// Creates the shared memory link in a worktree on Windows.
+    ///
+    /// NTFS hard links provide the same shared-file semantics without requiring
+    /// Developer Mode or the SeCreateSymbolicLink privilege.
+    #[cfg(windows)]
     pub fn setup_memory_symlink(&self) -> std::io::Result<bool> {
-        // On non-Unix platforms, we don't create symlinks
-        // (worktree mode not supported)
-        Ok(false)
+        if self.is_primary {
+            return Ok(false);
+        }
+
+        let memories_path = self.memories_path();
+        let main_memories = self.main_memories_path();
+        if memories_path.exists() || memories_path.is_symlink() {
+            return Ok(false);
+        }
+
+        self.ensure_agent_dir()?;
+        std::fs::hard_link(&main_memories, &memories_path)?;
+        Ok(true)
     }
 
     /// Creates the specs symlink in a worktree pointing to main repo.
@@ -450,10 +472,22 @@ impl LoopContext {
         Ok(true)
     }
 
-    /// Creates the specs symlink in a worktree (non-Unix stub).
-    #[cfg(not(unix))]
+    /// Creates the specs junction in a Windows worktree.
+    #[cfg(windows)]
     pub fn setup_specs_symlink(&self) -> std::io::Result<bool> {
-        Ok(false)
+        if self.is_primary {
+            return Ok(false);
+        }
+
+        let specs_path = self.specs_dir();
+        let main_specs = self.main_specs_dir();
+        if specs_path.exists() || junction::exists(&specs_path).unwrap_or(false) {
+            return Ok(false);
+        }
+
+        self.ensure_ralph_dir()?;
+        junction::create(&main_specs, &specs_path)?;
+        Ok(true)
     }
 
     /// Creates the code tasks symlink in a worktree pointing to main repo.
@@ -488,10 +522,22 @@ impl LoopContext {
         Ok(true)
     }
 
-    /// Creates the code tasks symlink in a worktree (non-Unix stub).
-    #[cfg(not(unix))]
+    /// Creates the code-task junction in a Windows worktree.
+    #[cfg(windows)]
     pub fn setup_code_tasks_symlink(&self) -> std::io::Result<bool> {
-        Ok(false)
+        if self.is_primary {
+            return Ok(false);
+        }
+
+        let tasks_path = self.code_tasks_dir();
+        let main_tasks = self.main_code_tasks_dir();
+        if tasks_path.exists() || junction::exists(&tasks_path).unwrap_or(false) {
+            return Ok(false);
+        }
+
+        self.ensure_ralph_dir()?;
+        junction::create(&main_tasks, &tasks_path)?;
+        Ok(true)
     }
 
     /// Generates a context.md file in the worktree with metadata.
@@ -575,9 +621,12 @@ Local state (scratchpad, runtime tasks, events) is isolated to this worktree.
         Ok(())
     }
 
-    /// Sets up all worktree symlinks (non-Unix stub).
-    #[cfg(not(unix))]
+    /// Sets up all worktree links on Windows.
+    #[cfg(windows)]
     pub fn setup_worktree_symlinks(&self) -> std::io::Result<()> {
+        self.setup_memory_symlink()?;
+        self.setup_specs_symlink()?;
+        self.setup_code_tasks_symlink()?;
         Ok(())
     }
 }
@@ -986,5 +1035,41 @@ mod tests {
         assert!(ctx.memories_path().is_symlink());
         assert!(ctx.specs_dir().is_symlink());
         assert!(ctx.code_tasks_dir().is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_worktree_links_share_state_without_symlink_privilege() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().to_path_buf();
+        let worktree_path = repo_root.join(".worktrees/loop-windows");
+
+        std::fs::create_dir_all(repo_root.join(".ralph/agent")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".ralph/specs")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".ralph/tasks")).unwrap();
+        std::fs::write(repo_root.join(".ralph/agent/memories.md"), "# Memories\n").unwrap();
+        std::fs::write(repo_root.join(".ralph/specs/test.spec.md"), "# Spec\n").unwrap();
+        std::fs::write(repo_root.join(".ralph/tasks/test.code-task.md"), "# Task\n").unwrap();
+
+        let ctx = LoopContext::worktree("loop-windows", worktree_path, repo_root.clone());
+        ctx.ensure_directories().unwrap();
+        ctx.setup_worktree_symlinks().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(ctx.memories_path()).unwrap(),
+            "# Memories\n"
+        );
+        std::fs::write(ctx.memories_path(), "# Shared\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ctx.main_memories_path()).unwrap(),
+            "# Shared\n"
+        );
+        assert!(junction::exists(ctx.specs_dir()).unwrap());
+        assert!(junction::exists(ctx.code_tasks_dir()).unwrap());
+        assert!(ctx.specs_dir().join("test.spec.md").exists());
+        assert!(ctx.code_tasks_dir().join("test.code-task.md").exists());
+
+        ctx.setup_worktree_symlinks()
+            .expect("link setup is idempotent");
     }
 }

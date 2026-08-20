@@ -29,10 +29,16 @@ crossterm.workspace = true
 regex.workspace = true
 keyring.workspace = true
 reqwest.workspace = true
+fs4.workspace = true
 
 # For Unix file locking (flock)
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+# Cross-platform process liveness checks for native Windows support.
+[target.'cfg(windows)'.dependencies]
+junction = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Integration tests: verifies ACP child processes are cleaned up between hat transitions.
 //!
 //! Uses a mock script that spawns a child process (simulating an MCP server)

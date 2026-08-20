@@ -156,25 +156,51 @@ fn test_run_smoke_executes_user_scoped_hook_during_real_loop() {
     std::fs::create_dir_all(&user_config_dir).expect("create user config dir");
 
     let hook_marker = temp_path.join("global-hook-ran.txt");
-    let hook_script = temp_path.join("global-hook.sh");
-    let backend_script = temp_path.join("backend-complete.sh");
+    let hook_script_name = if cfg!(windows) {
+        "global-hook.cmd"
+    } else {
+        "global-hook.sh"
+    };
+    let backend_script_name = if cfg!(windows) {
+        "backend-complete.cmd"
+    } else {
+        "backend-complete.sh"
+    };
+    let hook_script = temp_path.join(hook_script_name);
+    let backend_script = temp_path.join(backend_script_name);
 
-    std::fs::write(
-        &hook_script,
-        format!(
-            "#!/bin/sh\nprintf 'hook ran' > \"{}\"\n",
-            hook_marker.display()
-        ),
-    )
-    .expect("write hook script");
-    std::fs::write(
-        &backend_script,
-        format!(
-            "#!/bin/sh\ncat >/dev/null\n\"{}\" emit LOOP_COMPLETE smoke-done\n",
-            env!("CARGO_BIN_EXE_ralph")
-        ),
-    )
-    .expect("write backend script");
+    if cfg!(windows) {
+        std::fs::write(
+            &hook_script,
+            "@echo off\r\necho hook ran > \"%~dp0global-hook-ran.txt\"\r\n",
+        )
+        .expect("write hook script");
+        std::fs::write(
+            &backend_script,
+            format!(
+                "@echo off\r\n\"{}\" emit LOOP_COMPLETE smoke-done\r\n",
+                env!("CARGO_BIN_EXE_ralph")
+            ),
+        )
+        .expect("write backend script");
+    } else {
+        std::fs::write(
+            &hook_script,
+            format!(
+                "#!/bin/sh\nprintf 'hook ran' > \"{}\"\n",
+                hook_marker.display()
+            ),
+        )
+        .expect("write hook script");
+        std::fs::write(
+            &backend_script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\n\"{}\" emit LOOP_COMPLETE smoke-done\n",
+                env!("CARGO_BIN_EXE_ralph")
+            ),
+        )
+        .expect("write backend script");
+    }
 
     #[cfg(unix)]
     {
@@ -187,31 +213,46 @@ fn test_run_smoke_executes_user_scoped_hook_during_real_loop() {
         }
     }
 
+    let hook_command = if cfg!(windows) {
+        r#"["cmd.exe", "/C", "global-hook.cmd"]"#
+    } else {
+        r#"["./global-hook.sh"]"#
+    };
     std::fs::write(
         user_config_dir.join("config.yml"),
-        r#"
+        format!(
+            r#"
 hooks:
   enabled: true
   events:
     pre.loop.start:
       - name: global-hook
-        command: ["./global-hook.sh"]
+        command: {hook_command}
         on_error: warn
-"#,
+"#
+        ),
     )
     .expect("write user config");
 
+    let backend_config = if cfg!(windows) {
+        r#"  command: "cmd.exe"
+  args: ["/C", "backend-complete.cmd"]"#
+    } else {
+        r#"  command: "./backend-complete.sh""#
+    };
     std::fs::write(
         temp_path.join("ralph.yml"),
-        r#"
+        format!(
+            r#"
 cli:
   backend: custom
-  command: "./backend-complete.sh"
+{backend_config}
   prompt_mode: stdin
 event_loop:
   max_iterations: 3
   max_runtime_seconds: 10
-"#,
+"#
+        ),
     )
     .expect("write local config");
 
@@ -229,8 +270,10 @@ event_loop:
     );
     assert!(
         hook_marker.exists(),
-        "expected global hook marker at {}",
-        hook_marker.display()
+        "expected global hook marker at {}; stderr: {}; stdout: {}",
+        hook_marker.display(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
@@ -244,34 +287,70 @@ fn test_run_smoke_local_hook_overrides_user_scoped_hook_during_real_loop() {
 
     let global_marker = temp_path.join("global-hook-ran.txt");
     let local_marker = temp_path.join("local-hook-ran.txt");
-    let global_hook_script = temp_path.join("global-hook.sh");
-    let local_hook_script = temp_path.join("local-hook.sh");
-    let backend_script = temp_path.join("backend-complete.sh");
+    let global_hook_name = if cfg!(windows) {
+        "global-hook.cmd"
+    } else {
+        "global-hook.sh"
+    };
+    let local_hook_name = if cfg!(windows) {
+        "local-hook.cmd"
+    } else {
+        "local-hook.sh"
+    };
+    let backend_script_name = if cfg!(windows) {
+        "backend-complete.cmd"
+    } else {
+        "backend-complete.sh"
+    };
+    let global_hook_script = temp_path.join(global_hook_name);
+    let local_hook_script = temp_path.join(local_hook_name);
+    let backend_script = temp_path.join(backend_script_name);
 
-    std::fs::write(
-        &global_hook_script,
-        format!(
-            "#!/bin/sh\nprintf 'global hook ran' > \"{}\"\n",
-            global_marker.display()
-        ),
-    )
-    .expect("write global hook script");
-    std::fs::write(
-        &local_hook_script,
-        format!(
-            "#!/bin/sh\nprintf 'local hook ran' > \"{}\"\n",
-            local_marker.display()
-        ),
-    )
-    .expect("write local hook script");
-    std::fs::write(
-        &backend_script,
-        format!(
-            "#!/bin/sh\ncat >/dev/null\n\"{}\" emit LOOP_COMPLETE smoke-done\n",
-            env!("CARGO_BIN_EXE_ralph")
-        ),
-    )
-    .expect("write backend script");
+    if cfg!(windows) {
+        std::fs::write(
+            &global_hook_script,
+            "@echo off\r\necho global hook ran > \"%~dp0global-hook-ran.txt\"\r\n",
+        )
+        .expect("write global hook script");
+        std::fs::write(
+            &local_hook_script,
+            "@echo off\r\necho local hook ran > \"%~dp0local-hook-ran.txt\"\r\n",
+        )
+        .expect("write local hook script");
+        std::fs::write(
+            &backend_script,
+            format!(
+                "@echo off\r\n\"{}\" emit LOOP_COMPLETE smoke-done\r\n",
+                env!("CARGO_BIN_EXE_ralph")
+            ),
+        )
+        .expect("write backend script");
+    } else {
+        std::fs::write(
+            &global_hook_script,
+            format!(
+                "#!/bin/sh\nprintf 'global hook ran' > \"{}\"\n",
+                global_marker.display()
+            ),
+        )
+        .expect("write global hook script");
+        std::fs::write(
+            &local_hook_script,
+            format!(
+                "#!/bin/sh\nprintf 'local hook ran' > \"{}\"\n",
+                local_marker.display()
+            ),
+        )
+        .expect("write local hook script");
+        std::fs::write(
+            &backend_script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\n\"{}\" emit LOOP_COMPLETE smoke-done\n",
+                env!("CARGO_BIN_EXE_ralph")
+            ),
+        )
+        .expect("write backend script");
+    }
 
     #[cfg(unix)]
     {
@@ -284,38 +363,58 @@ fn test_run_smoke_local_hook_overrides_user_scoped_hook_during_real_loop() {
         }
     }
 
+    let global_hook_command = if cfg!(windows) {
+        r#"["cmd.exe", "/C", "global-hook.cmd"]"#
+    } else {
+        r#"["./global-hook.sh"]"#
+    };
     std::fs::write(
         user_config_dir.join("config.yml"),
-        r#"
+        format!(
+            r#"
 hooks:
   enabled: true
   events:
     pre.loop.start:
       - name: global-hook
-        command: ["./global-hook.sh"]
+        command: {global_hook_command}
         on_error: warn
-"#,
+"#
+        ),
     )
     .expect("write user config");
 
+    let local_hook_command = if cfg!(windows) {
+        r#"["cmd.exe", "/C", "local-hook.cmd"]"#
+    } else {
+        r#"["./local-hook.sh"]"#
+    };
+    let backend_config = if cfg!(windows) {
+        r#"  command: "cmd.exe"
+  args: ["/C", "backend-complete.cmd"]"#
+    } else {
+        r#"  command: "./backend-complete.sh""#
+    };
     std::fs::write(
         temp_path.join("ralph.yml"),
-        r#"
+        format!(
+            r#"
 cli:
   backend: custom
-  command: "./backend-complete.sh"
+{backend_config}
   prompt_mode: stdin
 hooks:
   enabled: true
   events:
     pre.loop.start:
       - name: local-hook
-        command: ["./local-hook.sh"]
+        command: {local_hook_command}
         on_error: warn
 event_loop:
   max_iterations: 3
   max_runtime_seconds: 10
-"#,
+"#
+        ),
     )
     .expect("write local config");
 
@@ -333,8 +432,10 @@ event_loop:
     );
     assert!(
         local_marker.exists(),
-        "expected local hook marker at {}",
-        local_marker.display()
+        "expected local hook marker at {}; stderr: {}; stdout: {}",
+        local_marker.display(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     assert!(
         !global_marker.exists(),

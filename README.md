@@ -36,6 +36,9 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 cargo install ralph-cli
 ```
 
+Native Windows is supported through the `x86_64-pc-windows-msvc` build. Git for
+Windows is required for worktree operations; WSL is not required.
+
 > Homebrew is not currently published from this repository's automated release flow. Prefer npm, Cargo, or the GitHub Releases installer.
 
 ## Quick Start

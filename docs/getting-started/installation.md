@@ -88,6 +88,17 @@ If you have Rust installed:
 cargo install ralph-cli
 ```
 
+### Native Windows
+
+Windows is supported natively with the MSVC toolchain. Use npm or Cargo, or download
+the `x86_64-pc-windows-msvc` `.zip` archive from GitHub Releases. Git for Windows is
+required for worktree and merge operations; WSL and Developer Mode are not required.
+
+```powershell
+cargo install ralph-cli
+ralph --version
+```
+
 ### From Source
 
 For the latest development version:

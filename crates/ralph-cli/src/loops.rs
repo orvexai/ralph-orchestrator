@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use crate::process_control::terminate_process;
 use ralph_core::worktree::{list_ralph_worktrees, remove_worktree};
 use ralph_core::{
-    LoopRegistry, MergeButtonState, MergeQueue, MergeState, SuspendStateStore, merge_button_state,
-    truncate_with_ellipsis,
+    LoopRegistry, MergeButtonState, MergeQueue, MergeState, SuspendStateStore, is_process_alive,
+    merge_button_state, truncate_with_ellipsis,
 };
 
 /// Manage parallel loops.
@@ -277,24 +278,6 @@ fn get_merge_button_state(args: MergeButtonStateArgs) -> Result<()> {
 
     println!("{}", serde_json::to_string(&json)?);
     Ok(())
-}
-
-/// Check if a process is alive.
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::kill;
-        use nix::unistd::Pid;
-
-        // Signal 0 checks if process exists without sending a signal
-        kill(Pid::from_raw(pid as i32), None).is_ok()
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
 }
 
 /// Format duration as relative age (e.g., "5m", "2h", "1d").
@@ -622,14 +605,20 @@ fn show_logs(args: LogsArgs) -> Result<()> {
     }
 
     if args.follow {
-        // Use tail -f for following
-        let status = Command::new("tail")
-            .args(["-f", events_path.to_string_lossy().as_ref()])
-            .status()
-            .context("Failed to run tail")?;
+        #[cfg(windows)]
+        follow_file_windows(&events_path)?;
 
-        if !status.success() {
-            bail!("tail exited with error");
+        #[cfg(not(windows))]
+        {
+            // Preserve the existing Unix behavior and terminal semantics.
+            let status = Command::new("tail")
+                .args(["-f", events_path.to_string_lossy().as_ref()])
+                .status()
+                .context("Failed to run tail")?;
+
+            if !status.success() {
+                bail!("tail exited with error");
+            }
         }
     } else {
         // Just cat the file
@@ -639,6 +628,44 @@ fn show_logs(args: LogsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn follow_file_windows(path: &Path) -> Result<()> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    // Match the useful part of `tail -f`: show the current end of the log,
+    // then stream bytes appended by the loop. Keeping this in-process avoids
+    // requiring Git Bash, WSL, or a separately installed Unix utility.
+    let mut file = File::open(path).context("Failed to open events file")?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .context("Failed to read events file")?;
+
+    let lines = contents.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(10);
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    std::io::stdout().flush().ok();
+
+    file.seek(SeekFrom::End(0))
+        .context("Failed to seek events file")?;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .context("Failed to read appended events")?;
+        if read > 0 {
+            std::io::stdout()
+                .write_all(&buffer[..read])
+                .context("Failed to write followed events")?;
+            std::io::stdout().flush().ok();
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 /// Show history for a loop.
@@ -814,33 +841,26 @@ fn stop_loop(args: StopArgs) -> Result<()> {
         let registry = LoopRegistry::new(&cwd);
         if let Ok(Some(entry)) = registry.get(&loop_id) {
             if is_process_alive(entry.pid) {
-                #[cfg(unix)]
-                {
-                    use nix::sys::signal::{Signal, kill};
-                    use nix::unistd::Pid;
-
-                    let signal = if args.force {
-                        Signal::SIGKILL
+                println!(
+                    "Worktree gone. Requesting {} for orphan loop '{}' (PID {})...",
+                    if args.force {
+                        "forced termination"
                     } else {
-                        Signal::SIGTERM
-                    };
-                    println!(
-                        "Worktree gone. Sending {} to orphan loop '{}' (PID {})...",
-                        if args.force { "SIGKILL" } else { "SIGTERM" },
-                        loop_id,
-                        entry.pid
-                    );
-                    kill(Pid::from_raw(entry.pid as i32), signal)
-                        .context("Failed to send signal to orphan loop")?;
-                }
-                #[cfg(not(unix))]
-                {
-                    bail!("Signal sending not supported on this platform");
-                }
+                        "termination"
+                    },
+                    loop_id,
+                    entry.pid
+                );
+                terminate_process(entry.pid, args.force)
+                    .context("Failed to terminate orphan loop")?;
 
                 let wait_timeout = orphan_stop_wait_timeout(args.force);
                 if !wait_for_process_exit(entry.pid, wait_timeout) {
-                    let signal_name = if args.force { "SIGKILL" } else { "SIGTERM" };
+                    let signal_name = if args.force {
+                        "forced termination"
+                    } else {
+                        "termination"
+                    };
                     let force_hint = if args.force {
                         ""
                     } else {
@@ -878,25 +898,13 @@ fn stop_loop(args: StopArgs) -> Result<()> {
     }
 
     if args.force {
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{Signal, kill};
-            use nix::unistd::Pid;
-
-            println!(
-                "Sending SIGKILL to loop '{}' (PID {})...",
-                loop_id, metadata.pid
-            );
-            kill(Pid::from_raw(metadata.pid as i32), Signal::SIGKILL)
-                .context("Failed to send SIGKILL")?;
-            println!("Signal sent.");
-            return Ok(());
-        }
-
-        #[cfg(not(unix))]
-        {
-            bail!("--force is only supported on Unix systems");
-        }
+        println!(
+            "Requesting forced termination for loop '{}' (PID {})...",
+            loop_id, metadata.pid
+        );
+        terminate_process(metadata.pid, true).context("Failed to terminate loop")?;
+        println!("Termination requested.");
+        return Ok(());
     }
 
     let stop_path = target_root.join(".ralph/stop-requested");
@@ -1018,7 +1026,11 @@ fn attach_to_loop(args: AttachArgs) -> Result<()> {
     println!("Attaching to loop '{}' at {}...", loop_id, wt_path);
     println!("Type 'exit' to return.\n");
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell = if cfg!(windows) {
+        std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    };
 
     let status = Command::new(&shell)
         .current_dir(&wt_path)
@@ -1835,9 +1847,7 @@ mod tests {
     use crate::test_support::CwdGuard;
     use chrono::Utc;
     use ralph_core::loop_registry::LoopEntry;
-    use ralph_core::{
-        HookPhaseEvent, HookSuspendMode, LoopLock, SuspendStateRecord, SuspendStateStore,
-    };
+    use ralph_core::{HookPhaseEvent, HookSuspendMode, SuspendStateRecord, SuspendStateStore};
     use std::process::Command;
 
     fn write_suspend_state(store: &SuspendStateStore, loop_id: &str) {
@@ -2323,7 +2333,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let _cwd = CwdGuard::set(temp_dir.path());
 
-        let _lock = LoopLock::try_acquire(temp_dir.path(), "test prompt").expect("lock");
+        let _lock =
+            ralph_core::LoopLock::try_acquire(temp_dir.path(), "test prompt").expect("lock");
 
         stop_loop(StopArgs {
             loop_id: None,
@@ -2584,7 +2595,9 @@ mod tests {
             .status()
             .expect("git init -b master");
 
-        // Seed a commit so branch references are materialized.
+        // Seed a commit so branch references are materialized. Do this with
+        // Git commands directly so the test does not depend on a POSIX shell.
+        std::fs::write(temp_dir.path().join("README.md"), "init").expect("write README");
         let _ = Command::new("git")
             .args(["config", "user.email", "ci@example.com"])
             .current_dir(temp_dir.path())
@@ -2593,11 +2606,12 @@ mod tests {
             .args(["config", "user.name", "CI"])
             .current_dir(temp_dir.path())
             .status();
-        let _ = Command::new("sh")
-            .args([
-                "-c",
-                "printf 'init' > README.md && git add README.md && git commit -qm 'init'",
-            ])
+        let _ = Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(temp_dir.path())
+            .status();
+        let _ = Command::new("git")
+            .args(["commit", "-qm", "init"])
             .current_dir(temp_dir.path())
             .status();
 

@@ -60,6 +60,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # Native Windows is a supported release target. Keep this as a separate
+  # job so Unix PTY/signal coverage remains unchanged while Windows-specific
+  # locking, process ownership, and worktree-link code is exercised on its
+  # native OS.
+  windows:
+    name: Native Windows
+    runs-on: windows-2022
+    needs: check-embedded-files
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check all Windows targets
+        run: cargo check --workspace --all-targets
+      - name: Run core Windows tests
+        run: cargo test -p ralph-core --lib
+      - name: Run adapter Windows tests
+        run: cargo test -p ralph-adapters --lib
+      - name: Build release binary
+        run: cargo build -p ralph-cli --release
+
   # Clippy and Format checks also run in lint.yml on fork PRs
   # (pull_request_target, no secrets needed for fmt-only)
 
