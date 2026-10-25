@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    tags:
+    - '**'
   pull_request:
     branches: [main]
 
@@ -16,49 +17,51 @@ jobs:
     name: Check embedded files
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Check embedded files are in sync
-        run: ./scripts/sync-embedded-files.sh check
+    - uses: actions/checkout@v4
+    - name: Check embedded files are in sync
+      run: ./scripts/sync-embedded-files.sh check
 
   # Format check: no compile needed, runs in seconds
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Check formatting
-        run: ./scripts/ci-rust-gate.sh --skip-embedded-files --skip-clippy --skip-tests --skip-hooks-bdd --skip-mock-e2e
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: ./scripts/ci-rust-gate.sh --skip-embedded-files --skip-clippy 
+        --skip-tests --skip-hooks-bdd --skip-mock-e2e
 
   test:
     name: Test
     runs-on: ubuntu-latest
     needs: check-embedded-files
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: Run shared Rust CI gate
-        run: ./scripts/ci-rust-gate.sh --skip-embedded-files --skip-format
-      - name: Upload test artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-artifacts
-          path: |
-            .e2e-tests/report.md
-            .artifacts/hooks-bdd/
-          if-no-files-found: warn
-          retention-days: 30
+    - uses: actions/checkout@v4
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev 
+        pkg-config
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Run shared Rust CI gate
+      run: ./scripts/ci-rust-gate.sh --skip-embedded-files --skip-format
+    - name: Upload test artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-artifacts
+        path: |
+          .e2e-tests/report.md
+          .artifacts/hooks-bdd/
+        if-no-files-found: warn
+        retention-days: 30
 
   # Native Windows is a supported release target. Keep this as a separate
   # job so Unix PTY/signal coverage remains unchanged while Windows-specific
@@ -69,19 +72,19 @@ jobs:
     runs-on: windows-2022
     needs: check-embedded-files
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: Check all Windows targets
-        run: cargo check --workspace --all-targets
-      - name: Run core Windows tests
-        run: cargo test -p ralph-core --lib
-      - name: Run adapter Windows tests
-        run: cargo test -p ralph-adapters --lib
-      - name: Build release binary
-        run: cargo build -p ralph-cli --release
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Check all Windows targets
+      run: cargo check --workspace --all-targets
+    - name: Run core Windows tests
+      run: cargo test -p ralph-core --lib
+    - name: Run adapter Windows tests
+      run: cargo test -p ralph-adapters --lib
+    - name: Build release binary
+      run: cargo build -p ralph-cli --release
 
   # Clippy and Format checks also run in lint.yml on fork PRs
   # (pull_request_target, no secrets needed for fmt-only)
@@ -91,14 +94,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: check-embedded-files
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: npm ci
-      - run: npm run build
-      - run: npm run test:server
-      - run: npm run test -w @ralph-web/dashboard
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - run: npm ci
+    - run: npm run build
+    - run: npm run test:server
+    - run: npm run test -w @ralph-web/dashboard
 
   # Hooks mutation testing is expensive (~20min). Run locally with:
   #   ./scripts/hooks-mutation-gate.sh
@@ -112,14 +115,14 @@ jobs:
     needs: [check-embedded-files, test]
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: Check ralph-cli packages correctly
-        run: |
-          # This will fail if include_str! references files outside the crate
-          # Use --list to validate without resolving crates.io dependencies
-          cargo package -p ralph-cli --allow-dirty --list > /dev/null
-          echo "Package check passed - all embedded files are included"
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Check ralph-cli packages correctly
+      run: |
+        # This will fail if include_str! references files outside the crate
+        # Use --list to validate without resolving crates.io dependencies
+        cargo package -p ralph-cli --allow-dirty --list > /dev/null
+        echo "Package check passed - all embedded files are included"

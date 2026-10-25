@@ -5,8 +5,7 @@ name: Lint (Fork PRs)
 # Clippy has been moved into ci.yml to share the compilation cache with tests.
 
 on:
-  pull_request_target:
-    branches: [main]
+  workflow_dispatch: {}
 
 permissions: {}
 
@@ -20,16 +19,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
           # Required for pull_request_target: this workflow deliberately
           # checks out the fork's head SHA (no secrets, permissions:{}),
           # so opt into checking out fork PR code here.
-          allow-unsafe-pr-checkout: true
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+        allow-unsafe-pr-checkout: true
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: cargo fmt --all -- --check
